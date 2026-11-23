@@ -46,6 +46,10 @@
 #ifndef BLOOM_DIAG
 #define BLOOM_DIAG 1
 #endif
+// The magenta proof-of-life square in the bottom-left corner. Off by default now that the hooks are proven.
+#ifndef BLOOM_MARKER
+#define BLOOM_MARKER 0
+#endif
 
 namespace {
 
@@ -55,8 +59,13 @@ namespace {
 // names), NOT a Minecraft offset, so it should survive game updates unless Mojang
 // renames shader inputs.
 constexpr uint64_t kTargetFingerprint = 0x67045df0827b190dull;  // from your status file: s_ParticleTexture program (all particles; lit/unlit split TBD)
-constexpr int kBlurLevels = 4;
-constexpr float kIntensity = 0.8f;
+constexpr int kBlurLevels = 5;
+constexpr float kIntensity = 1.5f;   // glow strength (tune)
+// Bright-pass threshold (0..1, on the brightest colour channel of the particle pixel). From your probe data:
+// a LIT particle in the dark has a dark vertex colour (e.g. 353555ff) while an UNLIT one stays ffffffff,
+// so a cutoff of ~0.6 keeps dark lit particles from glowing. CAVEATS: a lit particle in full daylight is also
+// full brightness and WILL glow; an unlit particle with a dark tint will NOT. Set 0 to disable.
+constexpr float kThreshold = 0.6f;
 
 // ---- hook plumbing --------------------------------------------------------
 using DrawElementsFn = void (*)(GLenum, GLsizei, GLenum, const void*);
@@ -89,6 +98,7 @@ struct ProgStat {
   std::map<int, uint64_t> perFbo;
 };
 std::map<uint64_t, ProgStat> gProgStats;
+std::map<uint64_t, bool> gIsUiProg;              // fingerprint -> looks like a HUD/UI shader (has u_modelViewProj + HudOpacity)
 std::map<uint64_t, std::string> gDescByFp;      // fingerprint -> uniform/attribute names (truncated)
 std::map<int, std::pair<int, int>> gFboViewport;  // draw FBO id -> last viewport w,h
 std::string gBlitReport;                        // result of the depth-copy experiment
@@ -127,6 +137,7 @@ uint64_t fingerprintProgram(GLuint prog) {
   }
   gFingerprintByProgram[prog] = h;
   gDescByFp[h] = desc.substr(0, 220);
+  gIsUiProg[h] = desc.find("u_modelViewProj") != std::string::npos && desc.find("HudOpacity") != std::string::npos;
   if (gSelf) {
     gSelf->getLogger().info("new program id={} fp={:016x} uniforms={} attribs={} :: {}",
                             prog, h, nU, nA, desc.substr(0, 300));
@@ -266,7 +277,7 @@ void copyDepthIfNeeded() {
 }
 
 // ---- Stage 3-5: programs, blur chain, composite --------------------------
-struct Prog { GLuint id = 0; GLint uTex = -1, uHalf = -1, uIntensity = -1; };
+struct Prog { GLuint id = 0; GLint uTex = -1, uHalf = -1, uIntensity = -1, uThreshold = -1; };
 Prog gDown, gUp, gComposite;
 GLuint gEmptyVao = 0;
 Target gChain[kBlurLevels];
@@ -298,6 +309,7 @@ bool makeProg(Prog& p, const char* fs) {
   p.uTex = glGetUniformLocation(p.id, "uTex");
   p.uHalf = glGetUniformLocation(p.id, "uHalfPixel");
   p.uIntensity = glGetUniformLocation(p.id, "uIntensity");
+  p.uThreshold = glGetUniformLocation(p.id, "uThreshold");
   return true;
 }
 
@@ -309,7 +321,7 @@ bool initGpu() {
   return gGpuInit;
 }
 
-void drawFullscreen(const Prog& p, GLuint srcTex, const Target& dst, float halfX, float halfY, float intensity) {
+void drawFullscreen(const Prog& p, GLuint srcTex, const Target& dst, float halfX, float halfY, float intensity, float threshold = 0.f) {
   glBindFramebuffer(GL_FRAMEBUFFER, dst.fbo);
   glViewport(0, 0, dst.w, dst.h);
   glUseProgram(p.id);
@@ -318,6 +330,7 @@ void drawFullscreen(const Prog& p, GLuint srcTex, const Target& dst, float halfX
   glUniform1i(p.uTex, 0);
   if (p.uHalf >= 0) glUniform2f(p.uHalf, halfX, halfY);
   if (p.uIntensity >= 0) glUniform1f(p.uIntensity, intensity);
+  if (p.uThreshold >= 0) glUniform1f(p.uThreshold, threshold);
   glBindVertexArray(gEmptyVao);
   glDrawArrays(GL_TRIANGLES, 0, 3);
 }
@@ -333,11 +346,17 @@ void blurMask() {
   glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
   for (int i = 0; i < kBlurLevels; ++i) {  // down
     const GLuint src = (i == 0) ? gMask.color.tex : gChain[i - 1].tex;
-    drawFullscreen(gDown, src, gChain[i], 0.5f / gChain[i].w, 0.5f / gChain[i].h, 1.f);
+    drawFullscreen(gDown, src, gChain[i], 0.5f / gChain[i].w, 0.5f / gChain[i].h, 1.f, i == 0 ? kThreshold : 0.f);
   }
+  // Up chain is ADDITIVE: each coarser level is added onto the finer one, so the final level holds a
+  // multi-scale sum (tight core glow + wide halo) instead of only the widest blur.
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_ONE, GL_ONE);
+  glBlendEquation(GL_FUNC_ADD);
   for (int i = kBlurLevels - 1; i >= 1; --i) {  // up
     drawFullscreen(gUp, gChain[i].tex, gChain[i - 1], 0.5f / gChain[i].w, 0.5f / gChain[i].h, 1.f);
   }
+  glDisable(GL_BLEND);
 }
 
 void clearMaskColor(float r, float g, float b, float a) {
@@ -348,10 +367,33 @@ void clearMaskColor(float r, float g, float b, float a) {
   glClear(GL_COLOR_BUFFER_BIT);  // colour only: the depth buffer is SHARED with the game, never clear it
 }
 
-void runBloomAtSwap() {
+// Frame bookkeeping for stage 5: the bloom is composited just BEFORE the first HUD draw (so the HUD stays
+// crisp on top). If no HUD draw happens that frame, it is composited at swap time as a fallback.
+uint64_t gParticleFrame = ~0ull;   // last frame in which particle draws were replayed into the mask
+uint64_t gComposedFrame = ~0ull;   // last frame in which the bloom was composited
+
+void composeBloom() {
   if (!gMask.ready || !initGpu()) return;
   StateGuard guard;
-  const Target screen{0, 0, guard.vp[2], guard.vp[3]};
+  const Target screen{0, 0, gMask.color.w, gMask.color.h};  // NOT the swap-time viewport (that was the bottom-left bug)
+  blurMask();
+  glDisable(GL_DEPTH_TEST); glDisable(GL_SCISSOR_TEST); glDisable(GL_CULL_FACE); glDisable(GL_STENCIL_TEST);
+  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+  glEnable(GL_BLEND);   // ADD the blurred particles on top of the frame
+  glBlendFunc(GL_ONE, GL_ONE);
+  glBlendEquation(GL_FUNC_ADD);
+  drawFullscreen(gComposite, gChain[0].tex, screen, 0, 0, kIntensity);
+  clearMaskColor(0.f, 0.f, 0.f, 0.f);  // ready for next frame
+}
+
+void runBloomAtSwap() {
+#if BLOOM_STAGE >= 5
+  if (gParticleFrame == gFrame && gComposedFrame != gFrame) { gComposedFrame = gFrame; composeBloom(); }
+  return;
+#endif
+  if (!gMask.ready || !initGpu()) return;
+  StateGuard guard;
+  const Target screen{0, 0, gMask.color.w, gMask.color.h};
 
 #if BLOOM_STAGE == 3
   clearMaskColor(1.f, 0.f, 1.f, 1.f);  // test colour: magenta
@@ -605,6 +647,13 @@ bool noteDraw(int kind, GLsizei cnt = 0, GLsizei inst = 0) {
     }
   }
   if (dfbo == 0 && !gBlitTested && gFrame > 300 && gLastVp[2] >= 1500) runDepthBlitTest(gLastVp[2], gLastVp[3]);
+#if BLOOM_STAGE >= 5
+  // Composite just before the first HUD draw of the frame, once particles were replayed this frame.
+  if (dfbo == 0 && gParticleFrame == gFrame && gComposedFrame != gFrame && gIsUiProg[fp]) {
+    gComposedFrame = gFrame;
+    composeBloom();
+  }
+#endif
 #if BLOOM_DIAG
   if (fp == kTargetFingerprint) probeParticleDraw(static_cast<GLuint>(prog), cnt, inst);
 #endif
@@ -625,6 +674,7 @@ bool noteDraw(int kind, GLsizei cnt = 0, GLsizei inst = 0) {
 // Replay FIRST, then the real draw (see README: avoids the replay failing its own depth test).
 template <class F>
 void replayIntoMask(F&& draw) {
+  gParticleFrame = gFrame;
   copyDepthIfNeeded();  // mask gets the scene depth as it is at the first particle draw of the frame
   GLint prev = 0;
   glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev);
@@ -673,8 +723,10 @@ void* hkGetProc(const char* name) {
 EGLBoolean hkSwap(EGLDisplay d, EGLSurface s) {
   ++gFrame;
   ++gSwapCalls;
-#if BLOOM_DIAG
+#if BLOOM_MARKER
   drawMarker();
+#endif
+#if BLOOM_DIAG
   if (gFrame % 120 == 0) writeDiag();
 #endif
 #if BLOOM_STAGE == 1
