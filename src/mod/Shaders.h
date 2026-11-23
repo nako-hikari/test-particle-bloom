@@ -25,14 +25,20 @@ inline constexpr const char* kDownFS = R"(#version 300 es
 precision mediump float;
 uniform sampler2D uTex;
 uniform vec2 uHalfPixel;
+uniform float uThreshold;   // > 0 only on the FIRST pass: bright-pass with a soft knee
 in vec2 vUV;
 out vec4 oColor;
+vec4 pre(vec4 c) {
+  if (uThreshold <= 0.0) return c;
+  float l = max(c.r, max(c.g, c.b));
+  return c * smoothstep(uThreshold, uThreshold + 0.25, l);
+}
 void main() {
-  vec4 s = texture(uTex, vUV) * 4.0;
-  s += texture(uTex, vUV - uHalfPixel);
-  s += texture(uTex, vUV + uHalfPixel);
-  s += texture(uTex, vUV + vec2(uHalfPixel.x, -uHalfPixel.y));
-  s += texture(uTex, vUV - vec2(uHalfPixel.x, -uHalfPixel.y));
+  vec4 s = pre(texture(uTex, vUV)) * 4.0;
+  s += pre(texture(uTex, vUV - uHalfPixel));
+  s += pre(texture(uTex, vUV + uHalfPixel));
+  s += pre(texture(uTex, vUV + vec2(uHalfPixel.x, -uHalfPixel.y)));
+  s += pre(texture(uTex, vUV - vec2(uHalfPixel.x, -uHalfPixel.y)));
   oColor = s / 8.0;
 }
 )";
