@@ -4,6 +4,8 @@
 
 #include <pl/Mod.hpp>
 
+#include "mod/BloomMod.h"
+
 namespace clange_me {
 
 ClangeMeMod &ClangeMeMod::instance() {
@@ -52,12 +54,13 @@ bool ClangeMeMod::enable() {
     }
 
     self.getLogger().info("Config message: {}", mConfig.message);
+    bloom::install(self);
     return true;
 }
 
 bool ClangeMeMod::disable() {
     getSelf().getLogger().debug("Disabling...");
-    // Undo enable-time state here.
+    bloom::uninstall();
     return true;
 }
 
