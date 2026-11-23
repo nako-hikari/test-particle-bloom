@@ -93,6 +93,7 @@ std::map<uint64_t, std::string> gDescByFp;      // fingerprint -> uniform/attrib
 std::map<int, std::pair<int, int>> gFboViewport;  // draw FBO id -> last viewport w,h
 std::string gBlitReport;                        // result of the depth-copy experiment
 bool gBlitTested = false;
+std::vector<std::string> gProbeLines;          // latest sampled particle draws (see probeParticleDraw)
 std::string gLibNote;  // which .so the GL/EGL exports live in (dladdr)
 
 // ---- Stage 1: shader fingerprinting ---------------------------------------
@@ -426,6 +427,9 @@ void writeDiag() {
     for (auto& [n, c] : gProcNames) { if (k++ >= 40) break; text += " " + n; }
     text += "\n";
   }
+  text += "--- particle probes (latest sampled draws of the particle program) ---\n";
+  for (auto& l : gProbeLines) text += l + "\n";
+  text += "---\n";
   text += gBlitReport;
   text += "viewport per FBO:";
   for (auto& [fbo, wh] : gFboViewport) text += " " + std::to_string(fbo) + "=" + std::to_string(wh.first) + "x" + std::to_string(wh.second);
@@ -510,8 +514,73 @@ DrawElementsInstFn gOrigDrawElementsInst = nullptr;
 DrawArraysFn gOrigDrawArrays = nullptr;
 DrawArraysInstFn gOrigDrawArraysInst = nullptr;
 
+// ---- particle probe -------------------------------------------------------
+// Purpose: find out how a LIT particle differs from an UNLIT one. For a few sampled draws of the particle
+// shader we record: index/instance counts, the textures bound on units 0-3, and the first 16 bytes of the
+// a_color0 and a_position vertex data. UNVERIFIED assumption: the first bytes of each attribute's buffer
+// region belong to the first vertex of this draw.
+bool readAttrib(GLuint prog, const char* name, unsigned char* out, GLint& size, GLint& type, GLint& norm, GLint& stride) {
+  const GLint loc = glGetAttribLocation(prog, name);
+  if (loc < 0) return false;
+  GLint buf = 0;
+  glGetVertexAttribiv(loc, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &buf);
+  glGetVertexAttribiv(loc, GL_VERTEX_ATTRIB_ARRAY_SIZE, &size);
+  glGetVertexAttribiv(loc, GL_VERTEX_ATTRIB_ARRAY_TYPE, &type);
+  glGetVertexAttribiv(loc, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &norm);
+  glGetVertexAttribiv(loc, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &stride);
+  void* ptr = nullptr;
+  glGetVertexAttribPointerv(loc, GL_VERTEX_ATTRIB_ARRAY_POINTER, &ptr);
+  if (!buf) return false;
+  GLint prevBuf = 0;
+  glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prevBuf);
+  glBindBuffer(GL_ARRAY_BUFFER, buf);
+  GLint bsize = 0;
+  glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &bsize);
+  const intptr_t off = reinterpret_cast<intptr_t>(ptr);
+  bool ok = false;
+  if (off >= 0 && off + 16 <= bsize) {
+    void* m = glMapBufferRange(GL_ARRAY_BUFFER, off, 16, GL_MAP_READ_BIT);
+    if (m) { std::memcpy(out, m, 16); glUnmapBuffer(GL_ARRAY_BUFFER); ok = true; }
+  }
+  glBindBuffer(GL_ARRAY_BUFFER, prevBuf);
+  return ok;
+}
+
+void probeParticleDraw(GLuint prog, GLsizei count, GLsizei inst) {
+  static uint64_t lastFrame = ~0ull;
+  static int perFrame = 0;
+  if (gFrame % 20 != 0) return;  // sparse sampling: mapping buffers can stall the GPU
+  if (gFrame != lastFrame) { lastFrame = gFrame; perFrame = 0; }
+  if (++perFrame > 6) return;
+
+  GLint prevActive = 0, tex[4] = {0, 0, 0, 0};
+  glGetIntegerv(GL_ACTIVE_TEXTURE, &prevActive);
+  for (int u = 0; u < 4; ++u) {
+    glActiveTexture(GL_TEXTURE0 + u);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex[u]);
+  }
+  glActiveTexture(prevActive);
+
+  unsigned char col[16] = {0}, pos[16] = {0};
+  GLint cs = 0, ct = 0, cn = 0, cst = 0, ps = 0, pt = 0, pn = 0, pst = 0;
+  const bool haveCol = readAttrib(prog, "a_color0", col, cs, ct, cn, cst);
+  const bool havePos = readAttrib(prog, "a_position", pos, ps, pt, pn, pst);
+  float pf[4] = {0, 0, 0, 0};
+  std::memcpy(pf, pos, sizeof(pf));
+
+  char b[420];
+  std::snprintf(b, sizeof(b),
+                "f=%llu cnt=%d inst=%d tex=%d,%d,%d,%d | color(%s sz=%d type=0x%x norm=%d stride=%d)=%02x%02x%02x%02x %02x%02x%02x%02x"
+                " | pos(%s sz=%d type=0x%x stride=%d)=%.2f,%.2f,%.2f",
+                (unsigned long long)gFrame, (int)count, (int)inst, tex[0], tex[1], tex[2], tex[3],
+                haveCol ? "ok" : "no", cs, ct, cn, cst, col[0], col[1], col[2], col[3], col[4], col[5], col[6], col[7],
+                havePos ? "ok" : "no", ps, pt, pst, pf[0], pf[1], pf[2]);
+  gProbeLines.emplace_back(b);
+  if (gProbeLines.size() > 40) gProbeLines.erase(gProbeLines.begin());
+}
+
 // Called for every draw. Records stats; returns true when this draw must ALSO be replayed into the mask.
-bool noteDraw(int kind) {
+bool noteDraw(int kind, GLsizei cnt = 0, GLsizei inst = 0) {
   ++gDrawCalls;
   ++gDrawKinds[kind];
   GLint prog = 0;
@@ -536,6 +605,9 @@ bool noteDraw(int kind) {
     }
   }
   if (dfbo == 0 && !gBlitTested && gFrame > 300 && gLastVp[2] >= 1500) runDepthBlitTest(gLastVp[2], gLastVp[3]);
+#if BLOOM_DIAG
+  if (fp == kTargetFingerprint) probeParticleDraw(static_cast<GLuint>(prog), cnt, inst);
+#endif
 #if BLOOM_STAGE == 1
   gDrawsThisWindow[fp]++;
 #endif
@@ -562,19 +634,19 @@ void replayIntoMask(F&& draw) {
 }
 
 void hkDrawElements(GLenum m, GLsizei c, GLenum t, const void* i) {
-  if (noteDraw(0)) replayIntoMask([&] { gOrigDrawElements(m, c, t, i); });
+  if (noteDraw(0, c, 1)) replayIntoMask([&] { gOrigDrawElements(m, c, t, i); });
   gOrigDrawElements(m, c, t, i);
 }
 void hkDrawElementsInst(GLenum m, GLsizei c, GLenum t, const void* i, GLsizei n) {
-  if (noteDraw(1)) replayIntoMask([&] { gOrigDrawElementsInst(m, c, t, i, n); });
+  if (noteDraw(1, c, n)) replayIntoMask([&] { gOrigDrawElementsInst(m, c, t, i, n); });
   gOrigDrawElementsInst(m, c, t, i, n);
 }
 void hkDrawArrays(GLenum m, GLint f, GLsizei c) {
-  if (noteDraw(2)) replayIntoMask([&] { gOrigDrawArrays(m, f, c); });
+  if (noteDraw(2, c, 1)) replayIntoMask([&] { gOrigDrawArrays(m, f, c); });
   gOrigDrawArrays(m, f, c);
 }
 void hkDrawArraysInst(GLenum m, GLint f, GLsizei c, GLsizei n) {
-  if (noteDraw(3)) replayIntoMask([&] { gOrigDrawArraysInst(m, f, c, n); });
+  if (noteDraw(3, c, n)) replayIntoMask([&] { gOrigDrawArraysInst(m, f, c, n); });
   gOrigDrawArraysInst(m, f, c, n);
 }
 
