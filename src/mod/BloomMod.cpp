@@ -1,0 +1,410 @@
+// BloomMod.cpp - staged skeleton for a "real bloom for unlit particles" mod.
+//
+// STATUS: UNTESTED. Written in this session WITHOUT compiling against the
+// Preloader SDK and WITHOUT running on a device. Treat every GL-state detail
+// as "to verify on your phone".
+//
+// SDK names used (all taken from the official docs, see README sources):
+//   PL_REGISTER_MOD, ll::mod::NativeMod::current(), getLogger().info/warn,
+//   pl::memory::HookHandle(target, detour, &original, priority), .installed(), .reset(),
+//   pl::memory::HookPriority::Normal.
+// Everything else is standard OpenGL ES 3.0 / EGL / libc.
+//
+// Build stage with:  -DBLOOM_STAGE=N   (1..5)  - see README for how to verify each.
+//   1  log GL draw activity so you can find the particle program ("learn mode")
+//   2  create the mask framebuffer (shares the scene's depth buffer)
+//   3  draw a TEST colour into the mask and show it as a corner thumbnail
+//   4  replay particle draws into the mask + dual Kawase blur; show blurred thumbnail
+//   5  additive full-screen composite (the actual bloom)
+
+#include <pl/Mod.hpp>
+#include <pl/memory/Hook.hpp>
+
+#include <EGL/egl.h>
+#include <GLES3/gl3.h>
+#include <dlfcn.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "Shaders.h"
+
+#ifndef BLOOM_STAGE
+#define BLOOM_STAGE 1
+#endif
+
+namespace {
+
+// ---- configuration --------------------------------------------------------
+// TODO(you): fill this in after Stage 1. 0 = "learn mode, don't replay anything".
+// It is a fingerprint of the shader program (hash of its uniform + attribute
+// names), NOT a Minecraft offset, so it should survive game updates unless Mojang
+// renames shader inputs.
+constexpr uint64_t kTargetFingerprint = 0;
+constexpr int kBlurLevels = 4;
+constexpr float kIntensity = 0.8f;
+
+// ---- hook plumbing --------------------------------------------------------
+using DrawElementsFn = void (*)(GLenum, GLsizei, GLenum, const void*);
+using SwapFn = EGLBoolean (*)(EGLDisplay, EGLSurface);
+
+DrawElementsFn gOrigDrawElements = nullptr;
+SwapFn gOrigSwap = nullptr;
+pl::memory::HookHandle gHookDraw;
+pl::memory::HookHandle gHookSwap;
+ll::mod::NativeMod* gSelf = nullptr;
+uint64_t gFrame = 0;
+
+// ---- Stage 1: shader fingerprinting ---------------------------------------
+std::unordered_map<GLuint, uint64_t> gFingerprintByProgram;  // NOTE: GL may reuse ids; fine for a prototype
+std::unordered_map<uint64_t, uint32_t> gDrawsThisWindow;      // fingerprint -> draws
+
+uint64_t fnv1a(uint64_t h, const char* s) {
+  for (; *s; ++s) { h ^= static_cast<uint8_t>(*s); h *= 1099511628211ull; }
+  return h;
+}
+
+uint64_t fingerprintProgram(GLuint prog) {
+  auto it = gFingerprintByProgram.find(prog);
+  if (it != gFingerprintByProgram.end()) return it->second;
+
+  uint64_t h = 1469598103934665603ull;
+  std::string desc;
+  GLint nU = 0, nA = 0;
+  glGetProgramiv(prog, GL_ACTIVE_UNIFORMS, &nU);
+  glGetProgramiv(prog, GL_ACTIVE_ATTRIBUTES, &nA);
+  char name[128];
+  for (GLint i = 0; i < nU; ++i) {
+    GLsizei len = 0; GLint size = 0; GLenum type = 0;
+    glGetActiveUniform(prog, i, sizeof(name), &len, &size, &type, name);
+    h = fnv1a(h, name); desc += name; desc += ' ';
+  }
+  for (GLint i = 0; i < nA; ++i) {
+    GLsizei len = 0; GLint size = 0; GLenum type = 0;
+    glGetActiveAttrib(prog, i, sizeof(name), &len, &size, &type, name);
+    h = fnv1a(h, name); desc += name; desc += ' ';
+  }
+  gFingerprintByProgram[prog] = h;
+  if (gSelf) {
+    gSelf->getLogger().info("new program id={} fp={:016x} uniforms={} attribs={} :: {}",
+                            prog, h, nU, nA, desc.substr(0, 300));
+  }
+  return h;
+}
+
+// ---- GL state guard -------------------------------------------------------
+// bgfx (RenderDragon) caches GL state. If we change state behind its back and do
+// not restore it EXACTLY, the game can render garbage. Extend this list if you see glitches.
+struct StateGuard {
+  GLint fbo, readFbo, prog, vao, activeTex, tex0, vp[4], blendSrcRGB, blendDstRGB, blendSrcA, blendDstA,
+      blendEqRGB, blendEqA;
+  GLboolean blend, depth, scissor, cull, stencil, colorMask[4], depthMask;
+  StateGuard() {
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fbo);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFbo);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &activeTex);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex0);
+    glGetIntegerv(GL_VIEWPORT, vp);
+    glGetIntegerv(GL_BLEND_SRC_RGB, &blendSrcRGB);
+    glGetIntegerv(GL_BLEND_DST_RGB, &blendDstRGB);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA, &blendSrcA);
+    glGetIntegerv(GL_BLEND_DST_ALPHA, &blendDstA);
+    glGetIntegerv(GL_BLEND_EQUATION_RGB, &blendEqRGB);
+    glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &blendEqA);
+    blend = glIsEnabled(GL_BLEND);
+    depth = glIsEnabled(GL_DEPTH_TEST);
+    scissor = glIsEnabled(GL_SCISSOR_TEST);
+    cull = glIsEnabled(GL_CULL_FACE);
+    stencil = glIsEnabled(GL_STENCIL_TEST);
+    glGetBooleanv(GL_COLOR_WRITEMASK, colorMask);
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &depthMask);
+  }
+  ~StateGuard() {
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, readFbo);
+    glUseProgram(prog);
+    glBindVertexArray(vao);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex0);
+    glActiveTexture(activeTex);
+    glViewport(vp[0], vp[1], vp[2], vp[3]);
+    glBlendFuncSeparate(blendSrcRGB, blendDstRGB, blendSrcA, blendDstA);
+    glBlendEquationSeparate(blendEqRGB, blendEqA);
+    auto set = [](GLenum cap, GLboolean on) { on ? glEnable(cap) : glDisable(cap); };
+    set(GL_BLEND, blend); set(GL_DEPTH_TEST, depth); set(GL_SCISSOR_TEST, scissor);
+    set(GL_CULL_FACE, cull); set(GL_STENCIL_TEST, stencil);
+    glColorMask(colorMask[0], colorMask[1], colorMask[2], colorMask[3]);
+    glDepthMask(depthMask);
+  }
+};
+
+// ---- Stage 2: mask framebuffer -------------------------------------------
+struct Target { GLuint fbo = 0, tex = 0; int w = 0, h = 0; };
+struct Mask {
+  Target color;                 // RGBA8 mask (prototype; RGBA16F needs an extension check - TODO)
+  GLint sceneFbo = -1;          // which scene FBO we borrowed depth from
+  GLint depthName = -1;
+  bool ready = false;
+  bool warnedDefaultFb = false;
+} gMask;
+
+void makeTarget(Target& t, int w, int h, bool withFbo = true) {
+  if (!t.tex) glGenTextures(1, &t.tex);
+  glBindTexture(GL_TEXTURE_2D, t.tex);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  if (withFbo) {
+    if (!t.fbo) glGenFramebuffers(1, &t.fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, t.fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t.tex, 0);
+  }
+  t.w = w; t.h = h;
+}
+
+// Make the mask FBO share the scene's depth buffer, so particles hidden behind
+// terrain are depth-rejected in the mask exactly like in the real frame.
+// Must be called while the SCENE framebuffer is bound (i.e. during a particle draw).
+bool ensureMask() {
+  GLint fbo = 0, vp[4];
+  glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fbo);
+  glGetIntegerv(GL_VIEWPORT, vp);
+  if (fbo == 0) {
+    // Default framebuffer: its depth buffer cannot be attached to another FBO.
+    // TODO(fallback): glBlitFramebuffer depth into a depth texture, or render the mask
+    // without depth and reject in the composite using a copied depth texture.
+    if (!gMask.warnedDefaultFb && gSelf) {
+      gSelf->getLogger().warn("scene framebuffer is the default FB (0): depth sharing impossible");
+      gMask.warnedDefaultFb = true;
+    }
+    return false;
+  }
+  GLint type = 0, name = 0, stencilName = 0;
+  glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                        GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+  glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                        GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+  glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
+                                        GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &stencilName);
+  if (type == GL_NONE) return false;
+
+  const bool sameSize = gMask.color.w == vp[2] && gMask.color.h == vp[3];
+  if (gMask.ready && gMask.sceneFbo == fbo && gMask.depthName == name && sameSize) return true;
+
+  GLint prevTex = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
+  makeTarget(gMask.color, vp[2], vp[3]);  // leaves the mask FBO bound
+  const GLenum att = (stencilName == name && name != 0) ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
+  if (type == GL_RENDERBUFFER)
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, att, GL_RENDERBUFFER, name);
+  else if (type == GL_TEXTURE)  // TODO: query GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL / layer
+    glFramebufferTexture2D(GL_FRAMEBUFFER, att, GL_TEXTURE_2D, name, 0);
+  const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+  glBindTexture(GL_TEXTURE_2D, prevTex);
+  glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+
+  gMask.sceneFbo = fbo; gMask.depthName = name;
+  gMask.ready = (status == GL_FRAMEBUFFER_COMPLETE);
+  if (gSelf)
+    gSelf->getLogger().info("mask FBO {}x{} depthType=0x{:x} depthName={} status=0x{:x} ready={}",
+                            vp[2], vp[3], type, name, status, gMask.ready);
+  return gMask.ready;
+}
+
+// ---- Stage 3-5: programs, blur chain, composite --------------------------
+struct Prog { GLuint id = 0; GLint uTex = -1, uHalf = -1, uIntensity = -1; };
+Prog gDown, gUp, gComposite;
+GLuint gEmptyVao = 0;
+Target gChain[kBlurLevels];
+bool gGpuInit = false;
+
+GLuint compile(GLenum type, const char* src) {
+  GLuint s = glCreateShader(type);
+  glShaderSource(s, 1, &src, nullptr);
+  glCompileShader(s);
+  GLint ok = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+  if (!ok) {
+    char log[512]; glGetShaderInfoLog(s, sizeof(log), nullptr, log);
+    if (gSelf) gSelf->getLogger().error("shader compile failed: {}", log);
+    glDeleteShader(s); return 0;
+  }
+  return s;
+}
+
+bool makeProg(Prog& p, const char* fs) {
+  GLuint v = compile(GL_VERTEX_SHADER, bloom::shaders::kFullscreenVS);
+  GLuint f = compile(GL_FRAGMENT_SHADER, fs);
+  if (!v || !f) return false;
+  p.id = glCreateProgram();
+  glAttachShader(p.id, v); glAttachShader(p.id, f);
+  glLinkProgram(p.id);
+  glDeleteShader(v); glDeleteShader(f);
+  GLint ok = 0; glGetProgramiv(p.id, GL_LINK_STATUS, &ok);
+  if (!ok) { if (gSelf) gSelf->getLogger().error("program link failed"); return false; }
+  p.uTex = glGetUniformLocation(p.id, "uTex");
+  p.uHalf = glGetUniformLocation(p.id, "uHalfPixel");
+  p.uIntensity = glGetUniformLocation(p.id, "uIntensity");
+  return true;
+}
+
+bool initGpu() {
+  if (gGpuInit) return true;
+  gGpuInit = makeProg(gDown, bloom::shaders::kDownFS) && makeProg(gUp, bloom::shaders::kUpFS) &&
+             makeProg(gComposite, bloom::shaders::kCompositeFS);
+  if (gGpuInit) glGenVertexArrays(1, &gEmptyVao);
+  return gGpuInit;
+}
+
+void drawFullscreen(const Prog& p, GLuint srcTex, const Target& dst, float halfX, float halfY, float intensity) {
+  glBindFramebuffer(GL_FRAMEBUFFER, dst.fbo);
+  glViewport(0, 0, dst.w, dst.h);
+  glUseProgram(p.id);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, srcTex);
+  glUniform1i(p.uTex, 0);
+  if (p.uHalf >= 0) glUniform2f(p.uHalf, halfX, halfY);
+  if (p.uIntensity >= 0) glUniform1f(p.uIntensity, intensity);
+  glBindVertexArray(gEmptyVao);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+// Dual Kawase: mask -> level0 (1/2) -> level1 (1/4) ... then back up.
+void blurMask() {
+  for (int i = 0; i < kBlurLevels; ++i) {
+    const int w = std::max(1, gMask.color.w >> (i + 1)), h = std::max(1, gMask.color.h >> (i + 1));
+    if (gChain[i].w != w || gChain[i].h != h) makeTarget(gChain[i], w, h);
+  }
+  glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_SCISSOR_TEST);
+  glDisable(GL_CULL_FACE); glDisable(GL_STENCIL_TEST);
+  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+  for (int i = 0; i < kBlurLevels; ++i) {  // down
+    const GLuint src = (i == 0) ? gMask.color.tex : gChain[i - 1].tex;
+    drawFullscreen(gDown, src, gChain[i], 0.5f / gChain[i].w, 0.5f / gChain[i].h, 1.f);
+  }
+  for (int i = kBlurLevels - 1; i >= 1; --i) {  // up
+    drawFullscreen(gUp, gChain[i].tex, gChain[i - 1], 0.5f / gChain[i].w, 0.5f / gChain[i].h, 1.f);
+  }
+}
+
+void clearMaskColor(float r, float g, float b, float a) {
+  glBindFramebuffer(GL_FRAMEBUFFER, gMask.color.fbo);
+  glDisable(GL_SCISSOR_TEST);
+  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+  glClearColor(r, g, b, a);
+  glClear(GL_COLOR_BUFFER_BIT);  // colour only: the depth buffer is SHARED with the game, never clear it
+}
+
+void runBloomAtSwap() {
+  if (!gMask.ready || !initGpu()) return;
+  StateGuard guard;
+  const Target screen{0, 0, guard.vp[2], guard.vp[3]};
+
+#if BLOOM_STAGE == 3
+  clearMaskColor(1.f, 0.f, 1.f, 1.f);  // test colour: magenta
+  glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_SCISSOR_TEST);
+  Target thumb{0, 0, screen.w / 4, screen.h / 4};
+  drawFullscreen(gComposite, gMask.color.tex, thumb, 0, 0, 1.f);
+  clearMaskColor(0.f, 0.f, 0.f, 0.f);
+#elif BLOOM_STAGE >= 4
+  blurMask();
+  glDisable(GL_DEPTH_TEST); glDisable(GL_SCISSOR_TEST); glDisable(GL_CULL_FACE); glDisable(GL_STENCIL_TEST);
+  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+#if BLOOM_STAGE == 4
+  glDisable(GL_BLEND);  // debug: show the blurred mask in a corner thumbnail
+  Target thumb{0, 0, screen.w / 4, screen.h / 4};
+  drawFullscreen(gComposite, gChain[0].tex, thumb, 0, 0, 1.f);
+#else
+  glEnable(GL_BLEND);   // the actual bloom: ADD blurred particles on top of the frame
+  glBlendFunc(GL_ONE, GL_ONE);
+  glBlendEquation(GL_FUNC_ADD);
+  drawFullscreen(gComposite, gChain[0].tex, screen, 0, 0, kIntensity);
+#endif
+  clearMaskColor(0.f, 0.f, 0.f, 0.f);  // ready for next frame
+#endif
+}
+
+// ---- detours --------------------------------------------------------------
+void hkDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
+#if BLOOM_STAGE >= 1
+  GLint prog = 0;
+  glGetIntegerv(GL_CURRENT_PROGRAM, &prog);  // TODO(perf): track via a glUseProgram hook instead
+  const uint64_t fp = fingerprintProgram(static_cast<GLuint>(prog));
+#if BLOOM_STAGE == 1
+  gDrawsThisWindow[fp]++;
+#endif
+#if BLOOM_STAGE >= 4
+  if (kTargetFingerprint != 0 && fp == kTargetFingerprint && ensureMask()) {
+    // Replay FIRST, then draw for real. If we replayed second, the first draw could write
+    // depth and the replay (same depth func) would fail its own depth test.
+    GLint prevFbo = 0; glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gMask.color.fbo);
+    gOrigDrawElements(mode, count, type, indices);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevFbo);
+  }
+#elif BLOOM_STAGE >= 2
+  // Stages 2-3 only need the mask to exist; build it on the first draw we see.
+  if (!gMask.ready) ensureMask();
+#endif
+#endif
+  gOrigDrawElements(mode, count, type, indices);
+}
+
+EGLBoolean hkSwap(EGLDisplay d, EGLSurface s) {
+  ++gFrame;
+#if BLOOM_STAGE == 1
+  if (gFrame % 600 == 0 && gSelf) {
+    for (auto& [fp, n] : gDrawsThisWindow)
+      gSelf->getLogger().info("window summary: fp={:016x} draws={}", fp, n);
+    gDrawsThisWindow.clear();
+  }
+#endif
+#if BLOOM_STAGE >= 3
+  runBloomAtSwap();
+#endif
+  return gOrigSwap(d, s);
+}
+
+}  // namespace
+
+// ---- public entry points (called from the template's MyMod.cpp) ----------
+// Declared in BloomMod.h. The template's own mod class keeps PL_REGISTER_MOD;
+// it just calls bloom::install() in enable() and bloom::uninstall() in disable().
+#include "BloomMod.h"
+
+namespace bloom {
+
+bool install(ll::mod::NativeMod& self) {
+  gSelf = &self;
+  self.getLogger().info("particle-bloom starting, BLOOM_STAGE={}", BLOOM_STAGE);
+  // Hook target = address of the GL / EGL entry point. No libminecraftpe.so offsets needed.
+  // UNVERIFIED RISK: these exports can be tiny trampoline stubs that an inline hook can't patch.
+  void* drawT = dlsym(RTLD_DEFAULT, "glDrawElements");
+  void* swapT = dlsym(RTLD_DEFAULT, "eglSwapBuffers");
+  if (!drawT || !swapT) {
+    self.getLogger().warn("GL/EGL symbol lookup failed (draw={}, swap={})", drawT != nullptr, swapT != nullptr);
+    return false;
+  }
+  gHookDraw = pl::memory::HookHandle(drawT, reinterpret_cast<void*>(&hkDrawElements),
+                                     reinterpret_cast<void**>(&gOrigDrawElements),
+                                     pl::memory::HookPriority::Normal);
+  gHookSwap = pl::memory::HookHandle(swapT, reinterpret_cast<void*>(&hkSwap),
+                                     reinterpret_cast<void**>(&gOrigSwap),
+                                     pl::memory::HookPriority::Normal);
+  self.getLogger().info("hooks installed: draw={} swap={}", gHookDraw.installed(), gHookSwap.installed());
+  return true;
+}
+
+void uninstall() {
+  gHookDraw.reset();
+  gHookSwap.reset();
+  // GL objects are leaked on purpose (deleting needs the render thread's context). TODO for later.
+}
+
+}  // namespace bloom
