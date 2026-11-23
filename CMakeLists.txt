@@ -119,6 +119,7 @@ add_library(${MOD_LIBRARY_NAME} SHARED
     src/main.cpp
     src/mod/Config.cpp
     src/mod/MyMod.cpp
+    src/mod/BloomMod.cpp
 )
 
 set_target_properties(${MOD_LIBRARY_NAME} PROPERTIES
@@ -144,12 +145,14 @@ target_link_options(${MOD_LIBRARY_NAME}
 find_library(log-lib log REQUIRED)
 target_link_libraries(${MOD_LIBRARY_NAME} PRIVATE
     ${log-lib}
+    GLESv3
+    EGL
     nlohmann_json::nlohmann_json
     Boost::pfr
     magic_enum::magic_enum
     fmt::fmt
 )
-
+target_compile_definitions(${MOD_LIBRARY_NAME} PRIVATE BLOOM_STAGE=3)
 if(TARGET preloader)
     target_link_libraries(${MOD_LIBRARY_NAME} PRIVATE preloader)
 else()
