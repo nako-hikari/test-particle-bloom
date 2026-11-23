@@ -25,6 +25,9 @@
 #include <dlfcn.h>
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <map>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -34,6 +37,11 @@
 
 #ifndef BLOOM_STAGE
 #define BLOOM_STAGE 1
+#endif
+// Diagnostics (no adb needed): a small magenta square at the bottom-left corner drawn at swap time,
+// plus a status file. Set to 0 once everything works.
+#ifndef BLOOM_DIAG
+#define BLOOM_DIAG 1
 #endif
 
 namespace {
@@ -57,6 +65,12 @@ pl::memory::HookHandle gHookDraw;
 pl::memory::HookHandle gHookSwap;
 ll::mod::NativeMod* gSelf = nullptr;
 uint64_t gFrame = 0;
+
+// ---- diagnostics state ----
+std::string gDataDir;
+uint64_t gDrawCalls = 0, gSwapCalls = 0;
+std::map<int, uint32_t> gFboCounts;   // draw FBO id -> number of draws seen
+GLint gLastVp[4] = {0, 0, 0, 0};
 
 // ---- Stage 1: shader fingerprinting ---------------------------------------
 std::unordered_map<GLuint, uint64_t> gFingerprintByProgram;  // NOTE: GL may reuse ids; fine for a prototype
@@ -330,12 +344,61 @@ void runBloomAtSwap() {
 #endif
 }
 
+// ---- diagnostics ---------------------------------------------------------
+// Proof-of-life marker: if you see a magenta square (120x120 px) in the bottom-left corner,
+// the eglSwapBuffers hook runs and can draw on the screen.
+void drawMarker() {
+  GLboolean sc = glIsEnabled(GL_SCISSOR_TEST);
+  GLint box[4]; glGetIntegerv(GL_SCISSOR_BOX, box);
+  GLfloat cc[4]; glGetFloatv(GL_COLOR_CLEAR_VALUE, cc);
+  GLboolean cm[4]; glGetBooleanv(GL_COLOR_WRITEMASK, cm);
+  GLint fbo = 0; glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fbo);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+  glEnable(GL_SCISSOR_TEST);
+  glScissor(0, 0, 120, 120);
+  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+  glClearColor(1.f, 0.f, 1.f, 1.f);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glClearColor(cc[0], cc[1], cc[2], cc[3]);
+  glColorMask(cm[0], cm[1], cm[2], cm[3]);
+  glScissor(box[0], box[1], box[2], box[3]);
+  sc ? glEnable(GL_SCISSOR_TEST) : glDisable(GL_SCISSOR_TEST);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+}
+
+void writeDiag() {
+  std::string text;
+  text += "frame=" + std::to_string(gFrame) + "\n";
+  text += "BLOOM_STAGE=" + std::to_string(BLOOM_STAGE) + "\n";
+  text += "swap_calls=" + std::to_string(gSwapCalls) + "\n";
+  text += "draw_calls=" + std::to_string(gDrawCalls) + "\n";
+  text += "programs_seen=" + std::to_string(gFingerprintByProgram.size()) + "\n";
+  text += "last_viewport=" + std::to_string(gLastVp[0]) + "," + std::to_string(gLastVp[1]) + "," +
+          std::to_string(gLastVp[2]) + "," + std::to_string(gLastVp[3]) + "\n";
+  text += "mask_ready=" + std::to_string(gMask.ready) + "\n";
+  text += "scene_fbo_is_default_warning=" + std::to_string(gMask.warnedDefaultFb) + "\n";
+  text += "draws_per_fbo (fbo:count):";
+  for (auto& [fbo, n] : gFboCounts) text += " " + std::to_string(fbo) + ":" + std::to_string(n);
+  text += "\n";
+  // Try the mod's own data dir, and also a spot easy to open in a file manager (may fail: UNVERIFIED).
+  for (const std::string& path : {gDataDir + "/bloom_status.txt", std::string("/storage/emulated/0/Download/bloom_status.txt")}) {
+    std::ofstream f(path, std::ios::trunc);
+    if (f) f << text;
+  }
+}
+
 // ---- detours --------------------------------------------------------------
 void hkDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
 #if BLOOM_STAGE >= 1
   GLint prog = 0;
   glGetIntegerv(GL_CURRENT_PROGRAM, &prog);  // TODO(perf): track via a glUseProgram hook instead
   const uint64_t fp = fingerprintProgram(static_cast<GLuint>(prog));
+  ++gDrawCalls;
+  {
+    GLint dfbo = 0; glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dfbo);
+    gFboCounts[dfbo]++;
+    glGetIntegerv(GL_VIEWPORT, gLastVp);
+  }
 #if BLOOM_STAGE == 1
   gDrawsThisWindow[fp]++;
 #endif
@@ -358,6 +421,11 @@ void hkDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices
 
 EGLBoolean hkSwap(EGLDisplay d, EGLSurface s) {
   ++gFrame;
+  ++gSwapCalls;
+#if BLOOM_DIAG
+  drawMarker();
+  if (gFrame % 120 == 0) writeDiag();
+#endif
 #if BLOOM_STAGE == 1
   if (gFrame % 600 == 0 && gSelf) {
     for (auto& [fp, n] : gDrawsThisWindow)
@@ -382,6 +450,7 @@ namespace bloom {
 
 bool install(ll::mod::NativeMod& self) {
   gSelf = &self;
+  gDataDir = self.getDataDir().string();
   self.getLogger().info("particle-bloom starting, BLOOM_STAGE={}", BLOOM_STAGE);
   // Hook target = address of the GL / EGL entry point. No libminecraftpe.so offsets needed.
   // UNVERIFIED RISK: these exports can be tiny trampoline stubs that an inline hook can't patch.
