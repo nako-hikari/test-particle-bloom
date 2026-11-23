@@ -30,6 +30,7 @@
 #include <map>
 #include <mutex>
 #include <cstring>
+#include <cstdio>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -80,6 +81,18 @@ pl::memory::HookHandle gHookGetProc;
 std::mutex gProcMutex;
 std::map<std::string, uint32_t> gProcNames;  // every name the game asked eglGetProcAddress for
 bool gSwapHookOk = false, gGetProcHookOk = false;
+
+// Per-shader statistics (keyed by program fingerprint) - helps spot the particle shader(s).
+struct ProgStat {
+  uint64_t draws = 0, blended = 0, noDepthWrite = 0, depthTested = 0, prevDraws = 0, recent = 0;
+  GLint srcRGB = 0, dstRGB = 0;
+  std::map<int, uint64_t> perFbo;
+};
+std::map<uint64_t, ProgStat> gProgStats;
+std::map<uint64_t, std::string> gDescByFp;      // fingerprint -> uniform/attribute names (truncated)
+std::map<int, std::pair<int, int>> gFboViewport;  // draw FBO id -> last viewport w,h
+std::string gBlitReport;                        // result of the depth-copy experiment
+bool gBlitTested = false;
 std::string gLibNote;  // which .so the GL/EGL exports live in (dladdr)
 
 // ---- Stage 1: shader fingerprinting ---------------------------------------
@@ -112,6 +125,7 @@ uint64_t fingerprintProgram(GLuint prog) {
     h = fnv1a(h, name); desc += name; desc += ' ';
   }
   gFingerprintByProgram[prog] = h;
+  gDescByFp[h] = desc.substr(0, 220);
   if (gSelf) {
     gSelf->getLogger().info("new program id={} fp={:016x} uniforms={} attribs={} :: {}",
                             prog, h, nU, nA, desc.substr(0, 300));
@@ -403,6 +417,23 @@ void writeDiag() {
     for (auto& [n, c] : gProcNames) { if (k++ >= 40) break; text += " " + n; }
     text += "\n";
   }
+  text += gBlitReport;
+  text += "viewport per FBO:";
+  for (auto& [fbo, wh] : gFboViewport) text += " " + std::to_string(fbo) + "=" + std::to_string(wh.first) + "x" + std::to_string(wh.second);
+  text += "\n--- shader programs (fp draws recent120 blended noDepthWrite depthTested blend(src/dst) fbos :: names) ---\n";
+  for (auto& [fp, st] : gProgStats) {
+    st.recent = st.draws - st.prevDraws;
+    st.prevDraws = st.draws;
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "%016llx draws=%llu recent=%llu blended=%llu nodepthwrite=%llu depthtest=%llu blend=0x%x/0x%x fbos=",
+                  (unsigned long long)fp, (unsigned long long)st.draws, (unsigned long long)st.recent,
+                  (unsigned long long)st.blended, (unsigned long long)st.noDepthWrite,
+                  (unsigned long long)st.depthTested, st.srcRGB, st.dstRGB);
+    text += buf;
+    for (auto& [fbo, n] : st.perFbo) text += std::to_string(fbo) + ":" + std::to_string(n) + ",";
+    text += " :: " + gDescByFp[fp] + "\n";
+  }
+  text += "---\n";
   text += "draws_per_fbo (fbo:count):";
   for (auto& [fbo, n] : gFboCounts) text += " " + std::to_string(fbo) + ":" + std::to_string(n);
   text += "\n";
@@ -414,6 +445,55 @@ void writeDiag() {
 }
 
 // ---- detours --------------------------------------------------------------
+// One-time experiment: can the DEFAULT framebuffer's depth be copied into our own buffer?
+// (Needed because the scene is drawn straight into FBO 0, whose depth buffer we cannot attach elsewhere.)
+// ES 3.0 requires matching depth formats for a depth blit, so we try several and log glGetError for each.
+void runDepthBlitTest(int w, int h) {
+  gBlitTested = true;
+  GLint rd = 0, dr = 0, orb = 0, depthBits = 0, stencilBits = 0;
+  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &rd);
+  glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dr);
+  glGetIntegerv(GL_RENDERBUFFER_BINDING, &orb);
+  glGetIntegerv(GL_DEPTH_BITS, &depthBits);
+  glGetIntegerv(GL_STENCIL_BITS, &stencilBits);
+  gBlitReport += "--- depth blit test (default FB -> own renderbuffer) ---\n";
+  gBlitReport += "test size=" + std::to_string(w) + "x" + std::to_string(h) + " default_fb depth_bits=" +
+                 std::to_string(depthBits) + " stencil_bits=" + std::to_string(stencilBits) + "\n";
+  struct F { GLenum fmt; GLenum att; const char* name; };
+  const F fs[] = {{GL_DEPTH_COMPONENT24, GL_DEPTH_ATTACHMENT, "D24"},
+                  {GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL_ATTACHMENT, "D24S8"},
+                  {GL_DEPTH_COMPONENT16, GL_DEPTH_ATTACHMENT, "D16"},
+                  {GL_DEPTH_COMPONENT32F, GL_DEPTH_ATTACHMENT, "D32F"},
+                  {GL_DEPTH32F_STENCIL8, GL_DEPTH_STENCIL_ATTACHMENT, "D32FS8"}};
+  while (glGetError() != GL_NO_ERROR) {}  // NOTE: swallows any pending game error; fine for a one-off test
+  for (const F& f : fs) {
+    GLuint rb = 0, fb = 0;
+    glGenRenderbuffers(1, &rb);
+    glBindRenderbuffer(GL_RENDERBUFFER, rb);
+    glRenderbufferStorage(GL_RENDERBUFFER, f.fmt, w, h);
+    const GLenum storeErr = glGetError();
+    glGenFramebuffers(1, &fb);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb);
+    glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, f.att, GL_RENDERBUFFER, rb);
+    const GLenum none = GL_NONE;
+    glDrawBuffers(1, &none);  // depth-only FBO must have draw buffer NONE to be complete
+    const GLenum status = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+    const GLenum blitErr = glGetError();
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "%s: storage_err=0x%x fbo_status=0x%x blit_err=0x%x %s\n", f.name, storeErr,
+                  status, blitErr, (blitErr == GL_NO_ERROR && status == GL_FRAMEBUFFER_COMPLETE) ? "<== WORKS" : "");
+    gBlitReport += buf;
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fb);
+    glDeleteRenderbuffers(1, &rb);
+  }
+  glBindRenderbuffer(GL_RENDERBUFFER, orb);
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, rd);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dr);
+}
+
 using DrawElementsInstFn = void (*)(GLenum, GLsizei, GLenum, const void*, GLsizei);
 using DrawArraysFn = void (*)(GLenum, GLint, GLsizei);
 using DrawArraysInstFn = void (*)(GLenum, GLint, GLsizei, GLsizei);
@@ -432,6 +512,21 @@ bool noteDraw(int kind) {
   glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dfbo);
   gFboCounts[dfbo]++;
   glGetIntegerv(GL_VIEWPORT, gLastVp);
+  gFboViewport[dfbo] = {gLastVp[2], gLastVp[3]};
+  {
+    ProgStat& st = gProgStats[fp];
+    ++st.draws;
+    st.perFbo[dfbo]++;
+    if (glIsEnabled(GL_BLEND)) ++st.blended;
+    if (glIsEnabled(GL_DEPTH_TEST)) ++st.depthTested;
+    GLboolean dm = GL_TRUE; glGetBooleanv(GL_DEPTH_WRITEMASK, &dm);
+    if (!dm) ++st.noDepthWrite;
+    if (st.draws == 1) {
+      glGetIntegerv(GL_BLEND_SRC_RGB, &st.srcRGB);
+      glGetIntegerv(GL_BLEND_DST_RGB, &st.dstRGB);
+    }
+  }
+  if (dfbo == 0 && !gBlitTested && gFrame > 300 && gLastVp[2] >= 1500) runDepthBlitTest(gLastVp[2], gLastVp[3]);
 #if BLOOM_STAGE == 1
   gDrawsThisWindow[fp]++;
 #endif
