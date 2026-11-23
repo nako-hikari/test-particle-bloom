@@ -152,7 +152,7 @@ target_link_libraries(${MOD_LIBRARY_NAME} PRIVATE
     magic_enum::magic_enum
     fmt::fmt
 )
-target_compile_definitions(${MOD_LIBRARY_NAME} PRIVATE BLOOM_STAGE=3)
+target_compile_definitions(${MOD_LIBRARY_NAME} PRIVATE BLOOM_STAGE=4)
 if(TARGET preloader)
     target_link_libraries(${MOD_LIBRARY_NAME} PRIVATE preloader)
 else()
