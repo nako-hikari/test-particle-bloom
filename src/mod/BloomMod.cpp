@@ -400,6 +400,7 @@ void drawMarker() {
 
 void writeDiag() {
   std::string text;
+  text += std::string("build=") + __DATE__ + " " + __TIME__ + "\n";  // proves WHICH binary is running
   text += "frame=" + std::to_string(gFrame) + "\n";
   text += "BLOOM_STAGE=" + std::to_string(BLOOM_STAGE) + "\n";
   text += "swap_calls=" + std::to_string(gSwapCalls) + "\n";
