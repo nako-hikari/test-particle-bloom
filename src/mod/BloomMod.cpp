@@ -28,6 +28,8 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
+#include <cstring>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -71,6 +73,14 @@ std::string gDataDir;
 uint64_t gDrawCalls = 0, gSwapCalls = 0;
 std::map<int, uint32_t> gFboCounts;   // draw FBO id -> number of draws seen
 GLint gLastVp[4] = {0, 0, 0, 0};
+uint64_t gDrawKinds[4] = {0, 0, 0, 0};  // 0=DrawElements 1=DrawElementsInstanced 2=DrawArrays 3=DrawArraysInstanced
+using GetProcFn = void* (*)(const char*);
+GetProcFn gOrigGetProc = nullptr;
+pl::memory::HookHandle gHookGetProc;
+std::mutex gProcMutex;
+std::map<std::string, uint32_t> gProcNames;  // every name the game asked eglGetProcAddress for
+bool gSwapHookOk = false, gGetProcHookOk = false;
+std::string gLibNote;  // which .so the GL/EGL exports live in (dladdr)
 
 // ---- Stage 1: shader fingerprinting ---------------------------------------
 std::unordered_map<GLuint, uint64_t> gFingerprintByProgram;  // NOTE: GL may reuse ids; fine for a prototype
@@ -377,6 +387,22 @@ void writeDiag() {
           std::to_string(gLastVp[2]) + "," + std::to_string(gLastVp[3]) + "\n";
   text += "mask_ready=" + std::to_string(gMask.ready) + "\n";
   text += "scene_fbo_is_default_warning=" + std::to_string(gMask.warnedDefaultFb) + "\n";
+  text += "swap_hook_installed=" + std::to_string(gSwapHookOk) + "\n";
+  text += "getproc_hook_installed=" + std::to_string(gGetProcHookOk) + "\n";
+  text += gLibNote;
+  text += "draw_kinds elements=" + std::to_string(gDrawKinds[0]) + " elementsInst=" + std::to_string(gDrawKinds[1]) +
+          " arrays=" + std::to_string(gDrawKinds[2]) + " arraysInst=" + std::to_string(gDrawKinds[3]) + "\n";
+  {
+    std::lock_guard<std::mutex> lk(gProcMutex);
+    text += "egl_getproc_distinct_names=" + std::to_string(gProcNames.size()) + "\n";
+    text += "glDraw*/glUseProgram/glBindFramebuffer names asked:";
+    for (auto& [n, c] : gProcNames)
+      if (n.rfind("glDraw", 0) == 0 || n == "glUseProgram" || n == "glBindFramebuffer") text += " " + n + "x" + std::to_string(c);
+    text += "\nfirst 40 names:";
+    int k = 0;
+    for (auto& [n, c] : gProcNames) { if (k++ >= 40) break; text += " " + n; }
+    text += "\n";
+  }
   text += "draws_per_fbo (fbo:count):";
   for (auto& [fbo, n] : gFboCounts) text += " " + std::to_string(fbo) + ":" + std::to_string(n);
   text += "\n";
@@ -388,35 +414,83 @@ void writeDiag() {
 }
 
 // ---- detours --------------------------------------------------------------
-void hkDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
-#if BLOOM_STAGE >= 1
+using DrawElementsInstFn = void (*)(GLenum, GLsizei, GLenum, const void*, GLsizei);
+using DrawArraysFn = void (*)(GLenum, GLint, GLsizei);
+using DrawArraysInstFn = void (*)(GLenum, GLint, GLsizei, GLsizei);
+DrawElementsInstFn gOrigDrawElementsInst = nullptr;
+DrawArraysFn gOrigDrawArrays = nullptr;
+DrawArraysInstFn gOrigDrawArraysInst = nullptr;
+
+// Called for every draw. Records stats; returns true when this draw must ALSO be replayed into the mask.
+bool noteDraw(int kind) {
+  ++gDrawCalls;
+  ++gDrawKinds[kind];
   GLint prog = 0;
   glGetIntegerv(GL_CURRENT_PROGRAM, &prog);  // TODO(perf): track via a glUseProgram hook instead
   const uint64_t fp = fingerprintProgram(static_cast<GLuint>(prog));
-  ++gDrawCalls;
-  {
-    GLint dfbo = 0; glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dfbo);
-    gFboCounts[dfbo]++;
-    glGetIntegerv(GL_VIEWPORT, gLastVp);
-  }
+  GLint dfbo = 0;
+  glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dfbo);
+  gFboCounts[dfbo]++;
+  glGetIntegerv(GL_VIEWPORT, gLastVp);
 #if BLOOM_STAGE == 1
   gDrawsThisWindow[fp]++;
 #endif
 #if BLOOM_STAGE >= 4
-  if (kTargetFingerprint != 0 && fp == kTargetFingerprint && ensureMask()) {
-    // Replay FIRST, then draw for real. If we replayed second, the first draw could write
-    // depth and the replay (same depth func) would fail its own depth test.
-    GLint prevFbo = 0; glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gMask.color.fbo);
-    gOrigDrawElements(mode, count, type, indices);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevFbo);
-  }
+  return kTargetFingerprint != 0 && fp == kTargetFingerprint && ensureMask();
 #elif BLOOM_STAGE >= 2
-  // Stages 2-3 only need the mask to exist; build it on the first draw we see.
   if (!gMask.ready) ensureMask();
+  return false;
+#else
+  (void)fp;
+  return false;
 #endif
-#endif
-  gOrigDrawElements(mode, count, type, indices);
+}
+
+// Replay FIRST, then the real draw (see README: avoids the replay failing its own depth test).
+template <class F>
+void replayIntoMask(F&& draw) {
+  GLint prev = 0;
+  glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gMask.color.fbo);
+  draw();
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prev);
+}
+
+void hkDrawElements(GLenum m, GLsizei c, GLenum t, const void* i) {
+  if (noteDraw(0)) replayIntoMask([&] { gOrigDrawElements(m, c, t, i); });
+  gOrigDrawElements(m, c, t, i);
+}
+void hkDrawElementsInst(GLenum m, GLsizei c, GLenum t, const void* i, GLsizei n) {
+  if (noteDraw(1)) replayIntoMask([&] { gOrigDrawElementsInst(m, c, t, i, n); });
+  gOrigDrawElementsInst(m, c, t, i, n);
+}
+void hkDrawArrays(GLenum m, GLint f, GLsizei c) {
+  if (noteDraw(2)) replayIntoMask([&] { gOrigDrawArrays(m, f, c); });
+  gOrigDrawArrays(m, f, c);
+}
+void hkDrawArraysInst(GLenum m, GLint f, GLsizei c, GLsizei n) {
+  if (noteDraw(3)) replayIntoMask([&] { gOrigDrawArraysInst(m, f, c, n); });
+  gOrigDrawArraysInst(m, f, c, n);
+}
+
+// Idea: the game (bgfx) probably looks up GL functions with eglGetProcAddress and keeps the
+// returned pointers, so hooking the libGLES exports misses them. Instead we hook eglGetProcAddress
+// itself and hand back OUR functions for the draw calls. UNVERIFIED: requires that this mod is
+// enabled before the game resolves its GL functions (the tutorial says enable() runs before game start).
+void* hkGetProc(const char* name) {
+  void* real = gOrigGetProc ? gOrigGetProc(name) : nullptr;
+  if (!name) return real;
+  {
+    std::lock_guard<std::mutex> lk(gProcMutex);
+    if (gProcNames.size() < 3000) ++gProcNames[name];
+  }
+  if (!real) return real;
+  auto is = [&](const char* s) { return std::strcmp(name, s) == 0; };
+  if (is("glDrawElements")) { gOrigDrawElements = reinterpret_cast<DrawElementsFn>(real); return reinterpret_cast<void*>(&hkDrawElements); }
+  if (is("glDrawElementsInstanced")) { gOrigDrawElementsInst = reinterpret_cast<DrawElementsInstFn>(real); return reinterpret_cast<void*>(&hkDrawElementsInst); }
+  if (is("glDrawArrays")) { gOrigDrawArrays = reinterpret_cast<DrawArraysFn>(real); return reinterpret_cast<void*>(&hkDrawArrays); }
+  if (is("glDrawArraysInstanced")) { gOrigDrawArraysInst = reinterpret_cast<DrawArraysInstFn>(real); return reinterpret_cast<void*>(&hkDrawArraysInst); }
+  return real;
 }
 
 EGLBoolean hkSwap(EGLDisplay d, EGLSurface s) {
@@ -452,26 +526,35 @@ bool install(ll::mod::NativeMod& self) {
   gSelf = &self;
   gDataDir = self.getDataDir().string();
   self.getLogger().info("particle-bloom starting, BLOOM_STAGE={}", BLOOM_STAGE);
-  // Hook target = address of the GL / EGL entry point. No libminecraftpe.so offsets needed.
-  // UNVERIFIED RISK: these exports can be tiny trampoline stubs that an inline hook can't patch.
-  void* drawT = dlsym(RTLD_DEFAULT, "glDrawElements");
+  // Hook targets: eglGetProcAddress (to intercept the game's GL lookups) and eglSwapBuffers (frame end).
+  void* getProcT = dlsym(RTLD_DEFAULT, "eglGetProcAddress");
   void* swapT = dlsym(RTLD_DEFAULT, "eglSwapBuffers");
-  if (!drawT || !swapT) {
-    self.getLogger().warn("GL/EGL symbol lookup failed (draw={}, swap={})", drawT != nullptr, swapT != nullptr);
+  void* drawT = dlsym(RTLD_DEFAULT, "glDrawElements");  // diagnostics only
+  for (auto [label, addr] : {std::pair<const char*, void*>{"eglGetProcAddress", getProcT},
+                             {"eglSwapBuffers", swapT}, {"glDrawElements", drawT}}) {
+    Dl_info info{};
+    gLibNote += std::string(label) + " addr=" + (addr ? "set" : "NULL") + " lib=" +
+                ((addr && dladdr(addr, &info) && info.dli_fname) ? info.dli_fname : "?") + "\n";
+  }
+  if (!getProcT || !swapT) {
+    self.getLogger().warn("EGL symbol lookup failed (getproc={}, swap={})", getProcT != nullptr, swapT != nullptr);
     return false;
   }
-  gHookDraw = pl::memory::HookHandle(drawT, reinterpret_cast<void*>(&hkDrawElements),
-                                     reinterpret_cast<void**>(&gOrigDrawElements),
-                                     pl::memory::HookPriority::Normal);
+  gHookGetProc = pl::memory::HookHandle(getProcT, reinterpret_cast<void*>(&hkGetProc),
+                                        reinterpret_cast<void**>(&gOrigGetProc),
+                                        pl::memory::HookPriority::Normal);
   gHookSwap = pl::memory::HookHandle(swapT, reinterpret_cast<void*>(&hkSwap),
                                      reinterpret_cast<void**>(&gOrigSwap),
                                      pl::memory::HookPriority::Normal);
-  self.getLogger().info("hooks installed: draw={} swap={}", gHookDraw.installed(), gHookSwap.installed());
+  gGetProcHookOk = gHookGetProc.installed();
+  gSwapHookOk = gHookSwap.installed();
+  self.getLogger().info("hooks installed: getproc={} swap={}", gGetProcHookOk, gSwapHookOk);
   return true;
 }
 
 void uninstall() {
   gHookDraw.reset();
+  gHookGetProc.reset();
   gHookSwap.reset();
   // GL objects are leaked on purpose (deleting needs the render thread's context). TODO for later.
 }
