@@ -54,7 +54,7 @@ namespace {
 // It is a fingerprint of the shader program (hash of its uniform + attribute
 // names), NOT a Minecraft offset, so it should survive game updates unless Mojang
 // renames shader inputs.
-constexpr uint64_t kTargetFingerprint = 0;
+constexpr uint64_t kTargetFingerprint = 0x67045df0827b190dull;  // from your status file: s_ParticleTexture program (all particles; lit/unlit split TBD)
 constexpr int kBlurLevels = 4;
 constexpr float kIntensity = 0.8f;
 
@@ -188,6 +188,7 @@ struct Mask {
   Target color;                 // RGBA8 mask (prototype; RGBA16F needs an extension check - TODO)
   GLint sceneFbo = -1;          // which scene FBO we borrowed depth from
   GLint depthName = -1;
+  GLuint depthRb = 0;          // our OWN depth+stencil buffer (copy of the scene depth)
   bool ready = false;
   bool warnedDefaultFb = false;
 } gMask;
@@ -208,52 +209,59 @@ void makeTarget(Target& t, int w, int h, bool withFbo = true) {
   t.w = w; t.h = h;
 }
 
-// Make the mask FBO share the scene's depth buffer, so particles hidden behind
-// terrain are depth-rejected in the mask exactly like in the real frame.
-// Must be called while the SCENE framebuffer is bound (i.e. during a particle draw).
+// The scene is drawn straight into the DEFAULT framebuffer (FBO 0, per your status file), and the default
+// framebuffer's depth buffer can't be attached to another FBO. So the mask keeps its OWN D24S8 depth buffer and,
+// once per frame (at the first particle draw), COPIES the scene depth into it with glBlitFramebuffer.
+// Your device test showed D24S8 is the one format for which that blit works.
+// Only the main scene view (FBO 0, viewport >= 1500 px wide) is used; other FBOs are ignored.
 bool ensureMask() {
   GLint fbo = 0, vp[4];
   glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fbo);
   glGetIntegerv(GL_VIEWPORT, vp);
-  if (fbo == 0) {
-    // Default framebuffer: its depth buffer cannot be attached to another FBO.
-    // TODO(fallback): glBlitFramebuffer depth into a depth texture, or render the mask
-    // without depth and reject in the composite using a copied depth texture.
-    if (!gMask.warnedDefaultFb && gSelf) {
-      gSelf->getLogger().warn("scene framebuffer is the default FB (0): depth sharing impossible");
-      gMask.warnedDefaultFb = true;
-    }
-    return false;
-  }
-  GLint type = 0, name = 0, stencilName = 0;
-  glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
-                                        GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
-  glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
-                                        GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
-  glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
-                                        GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &stencilName);
-  if (type == GL_NONE) return false;
+  if (fbo != 0 || vp[2] < 1500) return false;
+  if (gMask.ready && gMask.color.w == vp[2] && gMask.color.h == vp[3]) return true;
 
-  const bool sameSize = gMask.color.w == vp[2] && gMask.color.h == vp[3];
-  if (gMask.ready && gMask.sceneFbo == fbo && gMask.depthName == name && sameSize) return true;
+  GLint prevTex = 0, prevRb = 0, prevRead = 0, prevDraw = 0;
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
+  glGetIntegerv(GL_RENDERBUFFER_BINDING, &prevRb);
+  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevRead);
+  glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDraw);
 
-  GLint prevTex = 0; glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
   makeTarget(gMask.color, vp[2], vp[3]);  // leaves the mask FBO bound
-  const GLenum att = (stencilName == name && name != 0) ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
-  if (type == GL_RENDERBUFFER)
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, att, GL_RENDERBUFFER, name);
-  else if (type == GL_TEXTURE)  // TODO: query GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL / layer
-    glFramebufferTexture2D(GL_FRAMEBUFFER, att, GL_TEXTURE_2D, name, 0);
+  if (!gMask.depthRb) glGenRenderbuffers(1, &gMask.depthRb);
+  glBindRenderbuffer(GL_RENDERBUFFER, gMask.depthRb);
+  glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, vp[2], vp[3]);
+  glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, gMask.depthRb);
   const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-  glBindTexture(GL_TEXTURE_2D, prevTex);
-  glBindFramebuffer(GL_FRAMEBUFFER, fbo);
 
-  gMask.sceneFbo = fbo; gMask.depthName = name;
+  glBindTexture(GL_TEXTURE_2D, prevTex);
+  glBindRenderbuffer(GL_RENDERBUFFER, prevRb);
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, prevRead);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevDraw);
+
   gMask.ready = (status == GL_FRAMEBUFFER_COMPLETE);
   if (gSelf)
-    gSelf->getLogger().info("mask FBO {}x{} depthType=0x{:x} depthName={} status=0x{:x} ready={}",
-                            vp[2], vp[3], type, name, status, gMask.ready);
+    gSelf->getLogger().info("mask {}x{} (own D24S8 depth) status=0x{:x} ready={}", vp[2], vp[3], status, gMask.ready);
   return gMask.ready;
+}
+
+// Copy the scene's current depth into the mask's own depth buffer, once per frame.
+uint64_t gDepthCopiedFrame = ~0ull;
+void copyDepthIfNeeded() {
+  if (gDepthCopiedFrame == gFrame) return;
+  gDepthCopiedFrame = gFrame;
+  GLint rd = 0, dr = 0;
+  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &rd);
+  glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dr);
+  const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+  glDisable(GL_SCISSOR_TEST);  // scissor would clip the blit
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gMask.color.fbo);
+  glBlitFramebuffer(0, 0, gMask.color.w, gMask.color.h, 0, 0, gMask.color.w, gMask.color.h,
+                    GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+  if (scissor) glEnable(GL_SCISSOR_TEST);
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, rd);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dr);
 }
 
 // ---- Stage 3-5: programs, blur chain, composite --------------------------
@@ -544,6 +552,7 @@ bool noteDraw(int kind) {
 // Replay FIRST, then the real draw (see README: avoids the replay failing its own depth test).
 template <class F>
 void replayIntoMask(F&& draw) {
+  copyDepthIfNeeded();  // mask gets the scene depth as it is at the first particle draw of the frame
   GLint prev = 0;
   glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev);
   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gMask.color.fbo);
